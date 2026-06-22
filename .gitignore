@@ -1,0 +1,27 @@
+# Binaries / build output
+/bin/
+/dist/
+*.exe
+*.out
+*.test
+server
+livecheck
+
+# Env / secrets
+.env
+.env.*
+*.local
+
+# Go
+vendor/
+*.prof
+coverage.out
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+RUN.md
+DESIGN.md
