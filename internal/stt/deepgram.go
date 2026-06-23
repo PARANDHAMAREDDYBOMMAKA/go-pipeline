@@ -14,19 +14,23 @@ import (
 )
 
 type DeepgramClient struct {
-	APIKey string
-	Model  string
-	Lang   string
+	APIKey     string
+	Model      string
+	Lang       string
+	EndpointMs int
 }
 
-func NewDeepgramClient(apiKey, model, lang string) *DeepgramClient {
+func NewDeepgramClient(apiKey, model, lang string, endpointMs int) *DeepgramClient {
 	if model == "" {
 		model = "nova-2"
 	}
 	if lang == "" {
 		lang = "en"
 	}
-	return &DeepgramClient{APIKey: apiKey, Model: model, Lang: lang}
+	if endpointMs <= 0 {
+		endpointMs = 300
+	}
+	return &DeepgramClient{APIKey: apiKey, Model: model, Lang: lang, EndpointMs: endpointMs}
 }
 
 func (c *DeepgramClient) Open(ctx context.Context) (Stream, error) {
@@ -38,7 +42,7 @@ func (c *DeepgramClient) Open(ctx context.Context) (Stream, error) {
 	q.Set("language", c.Lang)
 	q.Set("interim_results", "true")
 	q.Set("smart_format", "true")
-	q.Set("endpointing", "300")
+	q.Set("endpointing", fmt.Sprintf("%d", c.EndpointMs))
 
 	endpoint := "wss://api.deepgram.com/v1/listen?" + q.Encode()
 	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
@@ -93,7 +97,8 @@ func (s *deepgramStream) read(ctx context.Context) {
 		select {
 		case s.events <- Transcript{
 			Text:       alt.Transcript,
-			Final:      r.IsFinal || r.SpeechFinal,
+			Final:      r.IsFinal,
+			EndOfTurn:  r.SpeechFinal,
 			Confidence: alt.Confidence,
 		}:
 		case <-ctx.Done():

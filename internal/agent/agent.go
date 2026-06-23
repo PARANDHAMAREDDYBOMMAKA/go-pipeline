@@ -7,6 +7,7 @@ import (
 
 	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/llm"
 	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/media"
+	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/obs"
 	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/stt"
 	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/tts"
 	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/vad"
@@ -45,6 +46,7 @@ type Config struct {
 	VADThreshold      float64
 	VADStartFrames    int
 	VADHangoverFrames int
+	Metrics           *obs.Metrics
 }
 
 func (c *Config) withDefaults() {
@@ -85,20 +87,31 @@ type Agent struct {
 	turns      chan string
 	userSpeech chan bool
 
+	metrics *obs.Metrics
+
 	mu              sync.Mutex
 	state           State
 	history         []llm.Message
 	bargeIn         func()
 	endpointPending bool
+	committed       bool
+	speechEndAt     time.Time
+	turnStart       time.Time
+	turnFirstAudio  bool
 }
 
 func New(cfg Config, sttc stt.Client, llmc llm.Client, ttsc tts.Client) *Agent {
 	cfg.withDefaults()
+	m := cfg.Metrics
+	if m == nil {
+		m = obs.New()
+	}
 	a := &Agent{
 		cfg:        cfg,
 		stt:        sttc,
 		llm:        llmc,
 		tts:        ttsc,
+		metrics:    m,
 		vad:        vad.NewEnergyVAD(cfg.VADThreshold, cfg.VADStartFrames, cfg.VADHangoverFrames),
 		sink:       newMicSink(cfg.MicBuffer),
 		src:        newVoiceSource(cfg.SynthBuffer),
@@ -114,6 +127,7 @@ func New(cfg Config, sttc stt.Client, llmc llm.Client, ttsc tts.Client) *Agent {
 
 func (a *Agent) Source() media.MediaSource { return a.src }
 func (a *Agent) Sink() media.MediaSink     { return a.sink }
+func (a *Agent) Metrics() *obs.Metrics     { return a.metrics }
 
 func (a *Agent) SetBargeInHook(f func()) {
 	a.mu.Lock()
@@ -201,8 +215,13 @@ func (a *Agent) ingest(ctx context.Context, sttStream stt.Stream, tb *transcript
 				if speaking {
 					a.mu.Lock()
 					a.endpointPending = false
+					a.committed = false
+					a.speechEndAt = time.Time{}
 					a.mu.Unlock()
 				} else {
+					a.mu.Lock()
+					a.speechEndAt = time.Now()
+					a.mu.Unlock()
 					a.endpoint(tb)
 				}
 			}
@@ -222,6 +241,10 @@ func (a *Agent) readTranscripts(ctx context.Context, sttStream stt.Stream, tb *t
 			}
 			if t.Final && t.Text != "" {
 				tb.append(t.Text)
+			}
+			if t.EndOfTurn {
+				a.endpoint(tb)
+			} else if t.Final {
 				a.tryEndpoint(tb)
 			}
 		}
@@ -230,6 +253,10 @@ func (a *Agent) readTranscripts(ctx context.Context, sttStream stt.Stream, tb *t
 
 func (a *Agent) endpoint(tb *transcriptBuffer) {
 	a.mu.Lock()
+	if a.committed {
+		a.mu.Unlock()
+		return
+	}
 	a.endpointPending = true
 	a.mu.Unlock()
 	a.tryEndpoint(tb)
@@ -238,7 +265,7 @@ func (a *Agent) endpoint(tb *transcriptBuffer) {
 func (a *Agent) tryEndpoint(tb *transcriptBuffer) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.endpointPending {
+	if !a.endpointPending || a.committed {
 		return
 	}
 	text := tb.take()
@@ -246,6 +273,10 @@ func (a *Agent) tryEndpoint(tb *transcriptBuffer) {
 		return
 	}
 	a.endpointPending = false
+	a.committed = true
+	if !a.speechEndAt.IsZero() {
+		a.metrics.Record(obs.EndpointWait, time.Since(a.speechEndAt))
+	}
 	select {
 	case a.turns <- text:
 	default:
@@ -261,11 +292,14 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 	interrupted := a.watchBargeIn(turnCtx, cancel)
 
 	a.mu.Lock()
+	a.turnStart = time.Now()
+	a.turnFirstAudio = false
 	a.history = append(a.history, llm.Message{Role: llm.RoleUser, Content: userText})
 	msgs := make([]llm.Message, len(a.history))
 	copy(msgs, a.history)
 	a.mu.Unlock()
 
+	llmReqAt := time.Now()
 	stream, err := a.llm.Generate(turnCtx, msgs)
 	if err != nil {
 		return
@@ -274,10 +308,15 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 
 	sent := llm.NewSentencizer(a.cfg.MinSentenceCh)
 	var reply string
+	ttftDone := false
 
 	for tok := range stream.Tokens() {
 		if tok.Done {
 			break
+		}
+		if !ttftDone && tok.Text != "" {
+			ttftDone = true
+			a.metrics.Record(obs.LLMTTFT, time.Since(llmReqAt))
 		}
 		reply += tok.Text
 		for _, frag := range sent.Push(tok.Text) {
@@ -321,6 +360,18 @@ func (a *Agent) watchBargeIn(turnCtx context.Context, cancel context.CancelFunc)
 	return interrupted
 }
 
+func (a *Agent) recordFirstAudio() {
+	a.mu.Lock()
+	if a.turnFirstAudio || a.turnStart.IsZero() {
+		a.mu.Unlock()
+		return
+	}
+	a.turnFirstAudio = true
+	start := a.turnStart
+	a.mu.Unlock()
+	a.metrics.Record(obs.TurnLatency, time.Since(start))
+}
+
 func (a *Agent) fireBargeIn() {
 	a.src.drain()
 	a.mu.Lock()
@@ -332,11 +383,13 @@ func (a *Agent) fireBargeIn() {
 }
 
 func (a *Agent) speak(ctx context.Context, text string) {
+	synthAt := time.Now()
 	st, err := a.tts.Synthesize(ctx, text, a.cfg.Voice)
 	if err != nil {
 		return
 	}
 	defer st.Close()
+	firstChunk := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -347,6 +400,11 @@ func (a *Agent) speak(ctx context.Context, text string) {
 			}
 			if f.SampleRate != 0 && f.SampleRate != media.BusSampleRate {
 				f = media.ResampleFrame(f, media.BusSampleRate)
+			}
+			if firstChunk {
+				firstChunk = false
+				a.metrics.Record(obs.TTSTTFB, time.Since(synthAt))
+				a.recordFirstAudio()
 			}
 			a.setState(StateSpeaking)
 			select {

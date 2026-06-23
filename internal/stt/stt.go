@@ -10,6 +10,7 @@ import (
 type Transcript struct {
 	Text       string
 	Final      bool
+	EndOfTurn  bool
 	Confidence float32
 	PTS        time.Duration
 }

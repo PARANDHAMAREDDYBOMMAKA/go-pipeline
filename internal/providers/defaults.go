@@ -9,7 +9,7 @@ import (
 
 func init() {
 	RegisterSTT("deepgram", func(c config.Config) (stt.Client, error) {
-		return stt.NewDeepgramClient(c.DeepgramAPIKey, c.DeepgramModel, c.DeepgramLang), nil
+		return stt.NewDeepgramClient(c.DeepgramAPIKey, c.DeepgramModel, c.DeepgramLang, c.DeepgramEndpointMs), nil
 	})
 
 	RegisterLLM("openai", func(c config.Config) (llm.Client, error) {
