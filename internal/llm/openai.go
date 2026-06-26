@@ -13,10 +13,12 @@ import (
 )
 
 type OpenAIClient struct {
-	APIKey  string
-	BaseURL string
-	Model   string
-	http    *http.Client
+	APIKey      string
+	BaseURL     string
+	Model       string
+	Temperature *float64
+	MaxTokens   int
+	http        *http.Client
 }
 
 func NewOpenAIClient(apiKey, baseURL, model string) *OpenAIClient {
@@ -30,42 +32,91 @@ func NewOpenAIClient(apiKey, baseURL, model string) *OpenAIClient {
 }
 
 type oaMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string       `json:"role"`
+	Content    string       `json:"content"`
+	ToolCalls  []oaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string       `json:"tool_call_id,omitempty"`
+	Name       string       `json:"name,omitempty"`
+}
+
+type oaToolCall struct {
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Index    int    `json:"index,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
+type oaTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
+		Parameters  json.RawMessage `json:"parameters,omitempty"`
+	} `json:"function"`
 }
 
 type oaRequest struct {
-	Model    string      `json:"model"`
-	Messages []oaMessage `json:"messages"`
-	Stream   bool        `json:"stream"`
+	Model       string      `json:"model"`
+	Messages    []oaMessage `json:"messages"`
+	Stream      bool        `json:"stream"`
+	Tools       []oaTool    `json:"tools,omitempty"`
+	Temperature *float64    `json:"temperature,omitempty"`
+	MaxTokens   int         `json:"max_tokens,omitempty"`
 }
 
 type oaChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string       `json:"content"`
+			ToolCalls []oaToolCall `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
-func (c *OpenAIClient) Generate(ctx context.Context, messages []Message) (Stream, error) {
-	reqBody := oaRequest{Model: c.Model, Stream: true}
-	for _, m := range messages {
-		reqBody.Messages = append(reqBody.Messages, oaMessage{Role: string(m.Role), Content: m.Content})
+func (c *OpenAIClient) Generate(ctx context.Context, req Request) (Stream, error) {
+	reqBody := oaRequest{Model: c.Model, Stream: true, MaxTokens: c.MaxTokens, Temperature: c.Temperature}
+	if req.Temperature != nil {
+		reqBody.Temperature = req.Temperature
+	}
+	if req.MaxTokens > 0 {
+		reqBody.MaxTokens = req.MaxTokens
+	}
+	for _, m := range req.Messages {
+		om := oaMessage{Role: string(m.Role), Content: m.Content, ToolCallID: m.ToolCallID, Name: m.Name}
+		for _, tc := range m.ToolCalls {
+			var otc oaToolCall
+			otc.ID = tc.ID
+			otc.Type = "function"
+			otc.Function.Name = tc.Name
+			otc.Function.Arguments = tc.Arguments
+			om.ToolCalls = append(om.ToolCalls, otc)
+		}
+		reqBody.Messages = append(reqBody.Messages, om)
+	}
+	for _, t := range req.Tools {
+		var ot oaTool
+		ot.Type = "function"
+		ot.Function.Name = t.Name
+		ot.Function.Description = t.Description
+		ot.Function.Parameters = t.Parameters
+		reqBody.Tools = append(reqBody.Tools, ot)
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +140,18 @@ func (s *openaiStream) read(ctx context.Context) {
 	defer close(s.tokens)
 	defer s.resp.Body.Close()
 
+	pending := map[int]*ToolCall{}
+	var order []int
+
+	emit := func(t Token) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case s.tokens <- t:
+			return true
+		}
+	}
+
 	scanner := bufio.NewScanner(s.resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -104,20 +167,42 @@ func (s *openaiStream) read(ctx context.Context) {
 		if json.Unmarshal([]byte(payload), &ch) != nil || len(ch.Choices) == 0 {
 			continue
 		}
-		text := ch.Choices[0].Delta.Content
-		if text == "" {
+		choice := ch.Choices[0]
+		for _, tc := range choice.Delta.ToolCalls {
+			acc, ok := pending[tc.Index]
+			if !ok {
+				acc = &ToolCall{}
+				pending[tc.Index] = acc
+				order = append(order, tc.Index)
+			}
+			if tc.ID != "" {
+				acc.ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				acc.Name = tc.Function.Name
+			}
+			acc.Arguments += tc.Function.Arguments
+		}
+		if choice.Delta.Content != "" {
+			if !emit(Token{Text: choice.Delta.Content}) {
+				return
+			}
+		}
+		if choice.FinishReason != nil && *choice.FinishReason == "tool_calls" {
+			break
+		}
+	}
+
+	for _, idx := range order {
+		tc := pending[idx]
+		if tc.Name == "" {
 			continue
 		}
-		select {
-		case <-ctx.Done():
+		if !emit(Token{ToolCall: tc}) {
 			return
-		case s.tokens <- Token{Text: text}:
 		}
 	}
-	select {
-	case <-ctx.Done():
-	case s.tokens <- Token{Done: true}:
-	}
+	emit(Token{Done: true})
 }
 
 func (s *openaiStream) Tokens() <-chan Token { return s.tokens }

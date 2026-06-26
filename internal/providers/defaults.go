@@ -13,15 +13,33 @@ func init() {
 	})
 
 	RegisterLLM("openai", func(c config.Config) (llm.Client, error) {
-		return llm.NewOpenAIClient(c.OpenAIAPIKey, c.OpenAIBaseURL, c.OpenAIModel), nil
+		client := llm.NewOpenAIClient(c.OpenAIAPIKey, c.OpenAIBaseURL, c.OpenAIModel)
+		applyLLMTuning(client, c)
+		return client, nil
 	})
 	RegisterLLM("groq", func(c config.Config) (llm.Client, error) {
-		return llm.NewOpenAIClient(c.GroqAPIKey, c.GroqBaseURL, c.GroqModel), nil
+		client := llm.NewOpenAIClient(c.GroqAPIKey, c.GroqBaseURL, c.GroqModel)
+		applyLLMTuning(client, c)
+		return client, nil
 	})
 
+	cartesiaVoice := func(c config.Config) tts.Voice {
+		return tts.Voice{ID: c.CartesiaVoiceID, Model: c.CartesiaModel, Language: c.CartesiaLanguage, Speed: c.CartesiaSpeed}
+	}
 	RegisterTTS("cartesia", func(c config.Config) (tts.Client, error) {
-		return tts.NewCartesiaClient(c.CartesiaAPIKey, c.CartesiaModel, c.CartesiaVersion), nil
-	}, func(c config.Config) tts.Voice {
-		return tts.Voice{ID: c.CartesiaVoiceID, Model: c.CartesiaModel}
-	})
+		return tts.NewCartesiaClient(c.CartesiaAPIKey, c.CartesiaModel, c.CartesiaVersion, c.CartesiaSampleRate), nil
+	}, cartesiaVoice)
+	RegisterTTS("cartesia_ws", func(c config.Config) (tts.Client, error) {
+		return tts.NewCartesiaWSClient(c.CartesiaAPIKey, c.CartesiaModel, c.CartesiaVersion, c.CartesiaSampleRate), nil
+	}, cartesiaVoice)
+}
+
+func applyLLMTuning(client *llm.OpenAIClient, c config.Config) {
+	if c.LLMTemperature >= 0 {
+		t := c.LLMTemperature
+		client.Temperature = &t
+	}
+	if c.LLMMaxTokens > 0 {
+		client.MaxTokens = c.LLMMaxTokens
+	}
 }

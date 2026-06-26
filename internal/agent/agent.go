@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,23 +36,35 @@ func (s State) String() string {
 	}
 }
 
+type ToolHandler func(ctx context.Context, name, args string) (string, error)
+
 type Config struct {
 	SystemPrompt      string
 	FirstMessage      string
 	Voice             tts.Voice
 	MinSentenceCh     int
+	SynthAhead        int
 	BargeInFrames     int
 	MicBuffer         int
 	SynthBuffer       int
 	VADThreshold      float64
 	VADStartFrames    int
 	VADHangoverFrames int
+	EndpointGraceMs   int
+	Temperature       *float64
+	MaxTokens         int
+	Tools             []llm.Tool
+	ToolHandler       ToolHandler
+	MaxToolIters      int
 	Metrics           *obs.Metrics
 }
 
 func (c *Config) withDefaults() {
 	if c.MinSentenceCh == 0 {
 		c.MinSentenceCh = 12
+	}
+	if c.SynthAhead == 0 {
+		c.SynthAhead = 2
 	}
 	if c.BargeInFrames == 0 {
 		c.BargeInFrames = 3
@@ -71,15 +84,19 @@ func (c *Config) withDefaults() {
 	if c.VADHangoverFrames == 0 {
 		c.VADHangoverFrames = 25
 	}
+	if c.MaxToolIters == 0 {
+		c.MaxToolIters = 4
+	}
 }
 
 type Agent struct {
 	cfg Config
 
-	stt stt.Client
-	llm llm.Client
-	tts tts.Client
-	vad vad.Detector
+	stt        stt.Client
+	llm        llm.Client
+	tts        tts.Client
+	ttsSession tts.Session
+	vad        vad.Detector
 
 	sink *micSink
 	src  *voiceSource
@@ -155,12 +172,27 @@ func (a *Agent) History() []llm.Message {
 	return out
 }
 
+func (a *Agent) appendHistory(m llm.Message) {
+	a.mu.Lock()
+	a.history = append(a.history, m)
+	a.mu.Unlock()
+}
+
 func (a *Agent) Run(ctx context.Context) error {
 	sttStream, err := a.stt.Open(ctx)
 	if err != nil {
 		return err
 	}
 	defer sttStream.Close()
+
+	if sc, ok := a.tts.(tts.SessionClient); ok {
+		if sess, serr := sc.OpenSession(ctx, a.cfg.Voice); serr == nil {
+			a.mu.Lock()
+			a.ttsSession = sess
+			a.mu.Unlock()
+			defer sess.Close()
+		}
+	}
 
 	a.setState(StateListening)
 	transcripts := &transcriptBuffer{}
@@ -222,7 +254,7 @@ func (a *Agent) ingest(ctx context.Context, sttStream stt.Stream, tb *transcript
 					a.mu.Lock()
 					a.speechEndAt = time.Now()
 					a.mu.Unlock()
-					a.endpoint(tb)
+					a.scheduleEndpoint(tb)
 				}
 			}
 		}
@@ -249,6 +281,22 @@ func (a *Agent) readTranscripts(ctx context.Context, sttStream stt.Stream, tb *t
 			}
 		}
 	}
+}
+
+func (a *Agent) scheduleEndpoint(tb *transcriptBuffer) {
+	grace := a.cfg.EndpointGraceMs
+	if grace <= 0 {
+		a.endpoint(tb)
+		return
+	}
+	a.mu.Lock()
+	if a.committed {
+		a.mu.Unlock()
+		return
+	}
+	a.endpointPending = true
+	a.mu.Unlock()
+	time.AfterFunc(time.Duration(grace)*time.Millisecond, func() { a.tryEndpoint(tb) })
 }
 
 func (a *Agent) endpoint(tb *transcriptBuffer) {
@@ -289,59 +337,189 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 	turnCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	interrupted := a.watchBargeIn(turnCtx, cancel)
+	a.watchBargeIn(turnCtx, cancel)
 
 	a.mu.Lock()
 	a.turnStart = time.Now()
 	a.turnFirstAudio = false
 	a.history = append(a.history, llm.Message{Role: llm.RoleUser, Content: userText})
-	msgs := make([]llm.Message, len(a.history))
-	copy(msgs, a.history)
 	a.mu.Unlock()
 
-	llmReqAt := time.Now()
-	stream, err := a.llm.Generate(turnCtx, msgs)
-	if err != nil {
-		return
+	ahead := a.cfg.SynthAhead
+	if ahead < 1 {
+		ahead = 1
 	}
-	defer stream.Close()
+	jobs := make(chan *ttsJob, ahead)
+	done := make(chan struct{})
+	go a.player(turnCtx, jobs, done)
 
-	sent := llm.NewSentencizer(a.cfg.MinSentenceCh)
-	var reply string
-	ttftDone := false
+	emit := func(frag string) bool {
+		job := a.startSynth(turnCtx, frag)
+		select {
+		case jobs <- job:
+			return true
+		case <-turnCtx.Done():
+			return false
+		}
+	}
 
-	for tok := range stream.Tokens() {
-		if tok.Done {
+	for iter := 0; iter < a.cfg.MaxToolIters; iter++ {
+		req := llm.Request{
+			Messages:    a.History(),
+			Tools:       a.cfg.Tools,
+			Temperature: a.cfg.Temperature,
+			MaxTokens:   a.cfg.MaxTokens,
+		}
+		llmReqAt := time.Now()
+		stream, err := a.llm.Generate(turnCtx, req)
+		if err != nil {
 			break
 		}
-		if !ttftDone && tok.Text != "" {
-			ttftDone = true
-			a.metrics.Record(obs.LLMTTFT, time.Since(llmReqAt))
+
+		sent := llm.NewSentencizer(a.cfg.MinSentenceCh)
+		var reply strings.Builder
+		var toolCalls []llm.ToolCall
+		ttftDone := false
+
+		for tok := range stream.Tokens() {
+			if tok.Done {
+				break
+			}
+			if tok.ToolCall != nil {
+				toolCalls = append(toolCalls, *tok.ToolCall)
+				continue
+			}
+			if tok.Text == "" {
+				continue
+			}
+			if !ttftDone {
+				ttftDone = true
+				a.metrics.Record(obs.LLMTTFT, time.Since(llmReqAt))
+			}
+			reply.WriteString(tok.Text)
+			for _, frag := range sent.Push(tok.Text) {
+				if !emit(frag) {
+					break
+				}
+			}
+			if turnCtx.Err() != nil {
+				break
+			}
 		}
-		reply += tok.Text
-		for _, frag := range sent.Push(tok.Text) {
-			a.speak(turnCtx, frag)
+		stream.Close()
+		if turnCtx.Err() == nil {
+			if rem := sent.Flush(); rem != "" {
+				emit(rem)
+			}
 		}
-		if turnCtx.Err() != nil {
-			break
+
+		replyText := reply.String()
+		if len(toolCalls) > 0 && a.cfg.ToolHandler != nil && turnCtx.Err() == nil {
+			a.appendHistory(llm.Message{Role: llm.RoleAssistant, Content: replyText, ToolCalls: toolCalls})
+			for _, tc := range toolCalls {
+				result, terr := a.cfg.ToolHandler(turnCtx, tc.Name, tc.Arguments)
+				if terr != nil {
+					result = "error: " + terr.Error()
+				}
+				a.appendHistory(llm.Message{Role: llm.RoleTool, Content: result, ToolCallID: tc.ID, Name: tc.Name})
+			}
+			continue
 		}
-	}
-	if turnCtx.Err() == nil {
-		if rem := sent.Flush(); rem != "" {
-			a.speak(turnCtx, rem)
+		if replyText != "" {
+			a.appendHistory(llm.Message{Role: llm.RoleAssistant, Content: replyText})
 		}
+		break
 	}
 
-	if reply != "" {
-		a.mu.Lock()
-		a.history = append(a.history, llm.Message{Role: llm.RoleAssistant, Content: reply})
-		a.mu.Unlock()
-	}
-	_ = interrupted
+	close(jobs)
+	<-done
 }
 
-func (a *Agent) watchBargeIn(turnCtx context.Context, cancel context.CancelFunc) *bool {
-	interrupted := new(bool)
+type ttsJob struct {
+	out     <-chan media.PCM
+	synthAt time.Time
+}
+
+func (a *Agent) startSynth(ctx context.Context, text string) *ttsJob {
+	out := make(chan media.PCM, 64)
+	job := &ttsJob{out: out, synthAt: time.Now()}
+	go func() {
+		defer close(out)
+		a.mu.Lock()
+		sess := a.ttsSession
+		a.mu.Unlock()
+
+		var st tts.Stream
+		var err error
+		if sess != nil {
+			st, err = sess.Synthesize(ctx, text)
+		} else {
+			st, err = a.tts.Synthesize(ctx, text, a.cfg.Voice)
+		}
+		if err != nil {
+			return
+		}
+		defer st.Close()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case f, ok := <-st.Audio():
+				if !ok {
+					return
+				}
+				if f.SampleRate != 0 && f.SampleRate != media.BusSampleRate {
+					f = media.ResampleFrame(f, media.BusSampleRate)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case out <- f:
+				}
+			}
+		}
+	}()
+	return job
+}
+
+func (a *Agent) player(ctx context.Context, jobs <-chan *ttsJob, done chan<- struct{}) {
+	defer close(done)
+	for job := range jobs {
+		a.drainJob(ctx, job)
+	}
+}
+
+func (a *Agent) drainJob(ctx context.Context, job *ttsJob) {
+	first := true
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f, ok := <-job.out:
+			if !ok {
+				return
+			}
+			if first {
+				first = false
+				a.metrics.Record(obs.TTSTTFB, time.Since(job.synthAt))
+				a.recordFirstAudio()
+			}
+			a.setState(StateSpeaking)
+			select {
+			case <-ctx.Done():
+				return
+			case a.src.frames <- f:
+			}
+		}
+	}
+}
+
+func (a *Agent) speak(ctx context.Context, text string) {
+	a.drainJob(ctx, a.startSynth(ctx, text))
+}
+
+func (a *Agent) watchBargeIn(turnCtx context.Context, cancel context.CancelFunc) {
 	go func() {
 		for {
 			select {
@@ -349,7 +527,6 @@ func (a *Agent) watchBargeIn(turnCtx context.Context, cancel context.CancelFunc)
 				return
 			case sp := <-a.userSpeech:
 				if sp && a.State() == StateSpeaking {
-					*interrupted = true
 					cancel()
 					a.fireBargeIn()
 					return
@@ -357,7 +534,6 @@ func (a *Agent) watchBargeIn(turnCtx context.Context, cancel context.CancelFunc)
 			}
 		}
 	}()
-	return interrupted
 }
 
 func (a *Agent) recordFirstAudio() {
@@ -379,40 +555,6 @@ func (a *Agent) fireBargeIn() {
 	a.mu.Unlock()
 	if hook != nil {
 		hook()
-	}
-}
-
-func (a *Agent) speak(ctx context.Context, text string) {
-	synthAt := time.Now()
-	st, err := a.tts.Synthesize(ctx, text, a.cfg.Voice)
-	if err != nil {
-		return
-	}
-	defer st.Close()
-	firstChunk := true
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case f, ok := <-st.Audio():
-			if !ok {
-				return
-			}
-			if f.SampleRate != 0 && f.SampleRate != media.BusSampleRate {
-				f = media.ResampleFrame(f, media.BusSampleRate)
-			}
-			if firstChunk {
-				firstChunk = false
-				a.metrics.Record(obs.TTSTTFB, time.Since(synthAt))
-				a.recordFirstAudio()
-			}
-			a.setState(StateSpeaking)
-			select {
-			case <-ctx.Done():
-				return
-			case a.src.frames <- f:
-			}
-		}
 	}
 }
 

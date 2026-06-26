@@ -25,15 +25,33 @@ type Config struct {
 	GroqBaseURL string
 	GroqModel   string
 
-	CartesiaAPIKey  string
-	CartesiaModel   string
-	CartesiaVersion string
-	CartesiaVoiceID string
+	CartesiaAPIKey     string
+	CartesiaModel      string
+	CartesiaVersion    string
+	CartesiaVoiceID    string
+	CartesiaSampleRate int
+	CartesiaLanguage   string
+	CartesiaSpeed      string
 
 	SystemPrompt string
 	FirstMessage string
 
-	PublicHost string
+	LLMTemperature float64
+	LLMMaxTokens   int
+
+	MinSentenceChars  int
+	SynthAhead        int
+	BargeInFrames     int
+	MicBuffer         int
+	SynthBuffer       int
+	VADThreshold      float64
+	VADStartFrames    int
+	VADHangoverFrames int
+	EndpointGraceMs   int
+
+	PublicHost   string
+	ProfilesFile string
+	Profiles     map[string]Profile
 }
 
 func env(key, def string) string {
@@ -52,8 +70,17 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
 func Load() Config {
-	return Config{
+	c := Config{
 		Port:               env("PORT", "8080"),
 		STTProvider:        env("STT_PROVIDER", "deepgram"),
 		LLMProvider:        env("LLM_PROVIDER", "openai"),
@@ -72,8 +99,29 @@ func Load() Config {
 		CartesiaModel:      env("CARTESIA_MODEL", "sonic-2"),
 		CartesiaVersion:    env("CARTESIA_VERSION", "2024-06-10"),
 		CartesiaVoiceID:    env("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
+		CartesiaSampleRate: envInt("CARTESIA_SAMPLE_RATE", 16000),
+		CartesiaLanguage:   env("CARTESIA_LANGUAGE", ""),
+		CartesiaSpeed:      env("CARTESIA_SPEED", ""),
 		SystemPrompt:       env("SYSTEM_PROMPT", "You are a helpful, concise voice assistant. Keep replies short and natural for speech."),
 		FirstMessage:       env("FIRST_MESSAGE", "Hello! How can I help you today?"),
+		LLMTemperature:     envFloat("LLM_TEMPERATURE", -1),
+		LLMMaxTokens:       envInt("LLM_MAX_TOKENS", 0),
+		MinSentenceChars:   envInt("MIN_SENTENCE_CHARS", 12),
+		SynthAhead:         envInt("SYNTH_AHEAD", 2),
+		BargeInFrames:      envInt("BARGE_IN_FRAMES", 3),
+		MicBuffer:          envInt("MIC_BUFFER", 8),
+		SynthBuffer:        envInt("SYNTH_BUFFER", 50),
+		VADThreshold:       envFloat("VAD_THRESHOLD", 500),
+		VADStartFrames:     envInt("VAD_START_FRAMES", 2),
+		VADHangoverFrames:  envInt("VAD_HANGOVER_FRAMES", 25),
+		EndpointGraceMs:    envInt("ENDPOINT_GRACE_MS", 0),
 		PublicHost:         os.Getenv("PUBLIC_HOST"),
+		ProfilesFile:       os.Getenv("PROFILES_FILE"),
 	}
+	if c.ProfilesFile != "" {
+		if profiles, err := LoadProfiles(c.ProfilesFile); err == nil {
+			c.Profiles = profiles
+		}
+	}
+	return c
 }

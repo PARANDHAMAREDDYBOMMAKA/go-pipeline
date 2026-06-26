@@ -15,23 +15,27 @@ import (
 	"github.com/PARANDHAMAREDDYBOMMAKA/go-pipeline/internal/media"
 )
 
-const cartesiaRate = 24000
+const defaultCartesiaRate = 16000
 
 type CartesiaClient struct {
 	APIKey  string
 	Model   string
 	Version string
+	Rate    int
 	http    *http.Client
 }
 
-func NewCartesiaClient(apiKey, model, version string) *CartesiaClient {
+func NewCartesiaClient(apiKey, model, version string, rate int) *CartesiaClient {
 	if model == "" {
 		model = "sonic-2"
 	}
 	if version == "" {
 		version = "2024-06-10"
 	}
-	return &CartesiaClient{APIKey: apiKey, Model: model, Version: version, http: httpx.Shared()}
+	if rate <= 0 {
+		rate = defaultCartesiaRate
+	}
+	return &CartesiaClient{APIKey: apiKey, Model: model, Version: version, Rate: rate, http: httpx.Shared()}
 }
 
 type caVoice struct {
@@ -45,12 +49,17 @@ type caOutputFormat struct {
 	SampleRate int    `json:"sample_rate"`
 }
 
+type caControls struct {
+	Speed string `json:"speed,omitempty"`
+}
+
 type caRequest struct {
 	ModelID      string         `json:"model_id"`
 	Transcript   string         `json:"transcript"`
 	Voice        caVoice        `json:"voice"`
 	OutputFormat caOutputFormat `json:"output_format"`
 	Language     string         `json:"language,omitempty"`
+	Controls     *caControls    `json:"__experimental_controls,omitempty"`
 }
 
 type caEvent struct {
@@ -70,8 +79,12 @@ func (c *CartesiaClient) Synthesize(ctx context.Context, text string, voice Voic
 		OutputFormat: caOutputFormat{
 			Container:  "raw",
 			Encoding:   "pcm_s16le",
-			SampleRate: cartesiaRate,
+			SampleRate: c.Rate,
 		},
+		Language: voice.Language,
+	}
+	if voice.Speed != "" {
+		reqBody.Controls = &caControls{Speed: voice.Speed}
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -95,7 +108,7 @@ func (c *CartesiaClient) Synthesize(ctx context.Context, text string, voice Voic
 	}
 
 	out := make(chan media.PCM, 64)
-	s := &cartesiaStream{audio: out, resp: resp}
+	s := &cartesiaStream{audio: out, resp: resp, rate: c.Rate}
 	go s.read(ctx)
 	return s, nil
 }
@@ -103,6 +116,7 @@ func (c *CartesiaClient) Synthesize(ctx context.Context, text string, voice Voic
 type cartesiaStream struct {
 	audio chan media.PCM
 	resp  *http.Response
+	rate  int
 }
 
 func (s *cartesiaStream) read(ctx context.Context) {
@@ -135,7 +149,7 @@ func (s *cartesiaStream) read(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case s.audio <- media.PCM{Samples: pcm, SampleRate: cartesiaRate}:
+		case s.audio <- media.PCM{Samples: pcm, SampleRate: s.rate}:
 		}
 	}
 	_ = scanner.Err()

@@ -24,9 +24,9 @@ func (c *MockClient) LastMessages() []Message {
 	return c.lastMsgs
 }
 
-func (c *MockClient) Generate(ctx context.Context, messages []Message) (Stream, error) {
+func (c *MockClient) Generate(ctx context.Context, req Request) (Stream, error) {
 	c.mu.Lock()
-	c.lastMsgs = messages
+	c.lastMsgs = req.Messages
 	toks := c.tokens
 	delay := c.delay
 	c.mu.Unlock()

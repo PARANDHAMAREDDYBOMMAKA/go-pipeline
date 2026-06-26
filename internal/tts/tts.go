@@ -7,8 +7,10 @@ import (
 )
 
 type Voice struct {
-	ID    string
-	Model string
+	ID       string
+	Model    string
+	Language string
+	Speed    string
 }
 
 type Stream interface {
@@ -18,4 +20,13 @@ type Stream interface {
 
 type Client interface {
 	Synthesize(ctx context.Context, text string, voice Voice) (Stream, error)
+}
+
+type Session interface {
+	Synthesize(ctx context.Context, text string) (Stream, error)
+	Close() error
+}
+
+type SessionClient interface {
+	OpenSession(ctx context.Context, voice Voice) (Session, error)
 }
