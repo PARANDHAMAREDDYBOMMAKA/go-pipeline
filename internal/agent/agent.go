@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,11 @@ type Config struct {
 	Tools             []llm.Tool
 	ToolHandler       ToolHandler
 	MaxToolIters      int
+	DialTimeoutMs     int
+	LLMRetries        int
+	TTSRetries        int
+	FallbackLLM       llm.Client
+	FallbackTTS       tts.Client
 	Metrics           *obs.Metrics
 }
 
@@ -86,6 +92,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.MaxToolIters == 0 {
 		c.MaxToolIters = 4
+	}
+	if c.DialTimeoutMs == 0 {
+		c.DialTimeoutMs = 8000
 	}
 }
 
@@ -125,7 +134,6 @@ func New(cfg Config, sttc stt.Client, llmc llm.Client, ttsc tts.Client) *Agent {
 	}
 	a := &Agent{
 		cfg:        cfg,
-		stt:        sttc,
 		llm:        llmc,
 		tts:        ttsc,
 		metrics:    m,
@@ -135,6 +143,7 @@ func New(cfg Config, sttc stt.Client, llmc llm.Client, ttsc tts.Client) *Agent {
 		turns:      make(chan string, 4),
 		userSpeech: make(chan bool, 16),
 	}
+	a.stt = stt.WithReconnect(sttc, func() { a.metrics.Inc(obs.STTReconnect) })
 	a.history = []llm.Message{{Role: llm.RoleSystem, Content: cfg.SystemPrompt}}
 	if cfg.FirstMessage != "" {
 		a.history = append(a.history, llm.Message{Role: llm.RoleAssistant, Content: cfg.FirstMessage})
@@ -353,10 +362,15 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 	done := make(chan struct{})
 	go a.player(turnCtx, jobs, done)
 
+	var spoken strings.Builder
 	emit := func(frag string) bool {
 		job := a.startSynth(turnCtx, frag)
 		select {
 		case jobs <- job:
+			if spoken.Len() > 0 {
+				spoken.WriteByte(' ')
+			}
+			spoken.WriteString(frag)
 			return true
 		case <-turnCtx.Done():
 			return false
@@ -371,7 +385,7 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 			MaxTokens:   a.cfg.MaxTokens,
 		}
 		llmReqAt := time.Now()
-		stream, err := a.llm.Generate(turnCtx, req)
+		stream, err := a.generate(turnCtx, req)
 		if err != nil {
 			break
 		}
@@ -425,6 +439,9 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 			}
 			continue
 		}
+		if turnCtx.Err() != nil {
+			replyText = strings.TrimSpace(spoken.String())
+		}
 		if replyText != "" {
 			a.appendHistory(llm.Message{Role: llm.RoleAssistant, Content: replyText})
 		}
@@ -433,6 +450,140 @@ func (a *Agent) handleTurn(ctx context.Context, userText string) {
 
 	close(jobs)
 	<-done
+}
+
+func (a *Agent) dialTimeout() time.Duration {
+	if a.cfg.DialTimeoutMs <= 0 {
+		return 8 * time.Second
+	}
+	return time.Duration(a.cfg.DialTimeoutMs) * time.Millisecond
+}
+
+func retryBackoff(attempt int) time.Duration {
+	d := 150 * time.Millisecond * time.Duration(1<<attempt)
+	if d > time.Second {
+		d = time.Second
+	}
+	return d
+}
+
+type cancelLLMStream struct {
+	llm.Stream
+	cancel context.CancelFunc
+}
+
+func (s cancelLLMStream) Close() error {
+	err := s.Stream.Close()
+	s.cancel()
+	return err
+}
+
+func (a *Agent) generate(ctx context.Context, req llm.Request) (llm.Stream, error) {
+	sources := []llm.Client{a.llm}
+	if a.cfg.FallbackLLM != nil {
+		sources = append(sources, a.cfg.FallbackLLM)
+	}
+	var lastErr error
+	for ci, client := range sources {
+		if ci > 0 {
+			a.metrics.Inc(obs.LLMFallback)
+		}
+		for attempt := 0; attempt <= a.cfg.LLMRetries; attempt++ {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			actx, cancel := context.WithCancel(ctx)
+			timer := time.AfterFunc(a.dialTimeout(), cancel)
+			stream, err := client.Generate(actx, req)
+			timer.Stop()
+			if err == nil {
+				return cancelLLMStream{Stream: stream, cancel: cancel}, nil
+			}
+			cancel()
+			lastErr = err
+			a.metrics.Inc(obs.LLMError)
+			if attempt < a.cfg.LLMRetries {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(retryBackoff(attempt)):
+				}
+			}
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("llm: no providers configured")
+	}
+	return nil, lastErr
+}
+
+type cancelTTSStream struct {
+	tts.Stream
+	cancel context.CancelFunc
+}
+
+func (s cancelTTSStream) Close() error {
+	err := s.Stream.Close()
+	s.cancel()
+	return err
+}
+
+func (a *Agent) synth(ctx context.Context, text string) (tts.Stream, error) {
+	a.mu.Lock()
+	sess := a.ttsSession
+	a.mu.Unlock()
+
+	var lastErr error
+	try := func(open func(context.Context) (tts.Stream, error)) (tts.Stream, bool) {
+		for attempt := 0; attempt <= a.cfg.TTSRetries; attempt++ {
+			if ctx.Err() != nil {
+				lastErr = ctx.Err()
+				return nil, false
+			}
+			actx, cancel := context.WithCancel(ctx)
+			timer := time.AfterFunc(a.dialTimeout(), cancel)
+			st, err := open(actx)
+			timer.Stop()
+			if err == nil {
+				return cancelTTSStream{Stream: st, cancel: cancel}, true
+			}
+			cancel()
+			lastErr = err
+			a.metrics.Inc(obs.TTSError)
+			if attempt < a.cfg.TTSRetries {
+				select {
+				case <-ctx.Done():
+					return nil, false
+				case <-time.After(retryBackoff(attempt)):
+				}
+			}
+		}
+		return nil, false
+	}
+
+	if sess != nil {
+		if st, ok := try(func(c context.Context) (tts.Stream, error) { return sess.Synthesize(c, text) }); ok {
+			return st, nil
+		}
+	} else {
+		if st, ok := try(func(c context.Context) (tts.Stream, error) { return a.tts.Synthesize(c, text, a.cfg.Voice) }); ok {
+			return st, nil
+		}
+	}
+
+	if a.cfg.FallbackTTS != nil {
+		a.metrics.Inc(obs.TTSFallback)
+		if st, ok := try(func(c context.Context) (tts.Stream, error) {
+			return a.cfg.FallbackTTS.Synthesize(c, text, a.cfg.Voice)
+		}); ok {
+			return st, nil
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("tts: synthesis failed")
+	}
+	return nil, lastErr
 }
 
 type ttsJob struct {
@@ -445,17 +596,7 @@ func (a *Agent) startSynth(ctx context.Context, text string) *ttsJob {
 	job := &ttsJob{out: out, synthAt: time.Now()}
 	go func() {
 		defer close(out)
-		a.mu.Lock()
-		sess := a.ttsSession
-		a.mu.Unlock()
-
-		var st tts.Stream
-		var err error
-		if sess != nil {
-			st, err = sess.Synthesize(ctx, text)
-		} else {
-			st, err = a.tts.Synthesize(ctx, text, a.cfg.Voice)
-		}
+		st, err := a.synth(ctx, text)
 		if err != nil {
 			return
 		}
